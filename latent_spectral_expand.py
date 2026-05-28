@@ -3,6 +3,11 @@ import math
 
 
 LSE_CONTEXT_TYPE = "LSE_CONTEXT"
+LATENT_SIZE_MULTIPLE = 2  # Anima / DiT latent H/W multiple.
+
+
+def snap_to_multiple(value, multiple=LATENT_SIZE_MULTIPLE):
+    return max(multiple, int(round(float(value) / multiple)) * multiple)
 
 
 def get_dct_matrix(N, dtype=torch.float32, device='cpu'):
@@ -281,7 +286,9 @@ def build_lse_context(
         seg["end_sigma"] = float(sigmas[-1].item())
 
     context = {
-        "version": 1,
+        "version": 2,
+        "latent_size_multiple": LATENT_SIZE_MULTIPLE,
+        "stage0_init": "dct_lowpass",
         "step_policy": step_policy,
         "scheduler_mode": scheduler_mode,
         "transition_mode": transition_mode,
@@ -318,6 +325,54 @@ def get_stage_seed(base_seed, seed_mode, stage_index):
     return (base_seed + int(stage_index)) & 0xffffffffffffffff
 
 
+def _latent_to_4d(samples):
+    is_5d = (samples.ndim == 5)
+    if is_5d:
+        B, C, T, H, W = samples.shape
+        samples_4d = samples.permute(0, 2, 1, 3, 4).reshape(B * T, C, H, W)
+        shape_info = (is_5d, B, C, T, H, W)
+    else:
+        B, C, H, W = samples.shape
+        samples_4d = samples
+        shape_info = (is_5d, B, C, None, H, W)
+    return samples_4d, shape_info
+
+
+def _latent_from_4d(samples_4d, shape_info, target_h, target_w):
+    is_5d, B, C, T, _, _ = shape_info
+    if is_5d:
+        return samples_4d.reshape(B, T, C, target_h, target_w).permute(0, 2, 1, 3, 4)
+    return samples_4d
+
+
+def dct_lowpass_latent(latent, scale):
+    """
+    Initialize stage 0 by low-pass filtering a full-size latent to the requested
+    stage scale. This matches the SPD prefix idea: users provide the final-size
+    latent, and stage 0 starts on a smaller DCT low-pass grid.
+    """
+    scale = float(scale)
+    samples = latent["samples"]
+    orig_dtype = samples.dtype
+    samples_4d, shape_info = _latent_to_4d(samples)
+    _, _, _, _, H, W = shape_info
+
+    target_h = min(snap_to_multiple(H * scale), H)
+    target_w = min(snap_to_multiple(W * scale), W)
+
+    if target_h >= H and target_w >= W:
+        return latent, 1.0
+
+    x32 = samples_4d.to(torch.float32)
+    F_full = dct2(x32)
+    x_low = idct2(F_full[:, :, :target_h, :target_w])
+    x_low_out = _latent_from_4d(x_low, shape_info, target_h, target_w)
+
+    out_latent = latent.copy()
+    out_latent["samples"] = x_low_out.to(orig_dtype)
+    return out_latent, math.sqrt((target_h / H) * (target_w / W))
+
+
 def spectral_expand_latent(
     latent,
     scale_factor,
@@ -332,18 +387,11 @@ def spectral_expand_latent(
     samples = latent["samples"]
     orig_dtype = samples.dtype
     device = samples.device
+    samples_4d, shape_info = _latent_to_4d(samples)
+    _, _, C, _, H, W = shape_info
 
-    is_5d = (samples.ndim == 5)
-    if is_5d:
-        B, C, T, H, W = samples.shape
-        samples_4d = samples.permute(0, 2, 1, 3, 4).reshape(B * T, C, H, W)
-    else:
-        B, C, H, W = samples.shape
-        T = None
-        samples_4d = samples
-
-    target_latent_height = max(H, int(round((H * float(scale_factor)) / 8.0) * 8))
-    target_latent_width = max(W, int(round((W * float(scale_factor)) / 8.0) * 8))
+    target_latent_height = max(H, snap_to_multiple(H * float(scale_factor)))
+    target_latent_width = max(W, snap_to_multiple(W * float(scale_factor)))
 
     if target_latent_height <= H and target_latent_width <= W:
         return latent, float(sigma), 1.0
@@ -401,11 +449,7 @@ def spectral_expand_latent(
     x_high = idct2(F_high)
     x_high = kappa * x_high
 
-    if is_5d:
-        x_high_out = x_high.reshape(B, T, C, target_latent_height, target_latent_width).permute(0, 2, 1, 3, 4)
-    else:
-        x_high_out = x_high
-
+    x_high_out = _latent_from_4d(x_high, shape_info, target_latent_height, target_latent_width)
     out_latent = latent.copy()
     out_latent["samples"] = x_high_out.to(orig_dtype)
     return out_latent, float(sigma_aligned), float(r_eff)
@@ -530,7 +574,11 @@ class LSEStagePrepare:
         processed_latent = latent
         transition_sigma_used = 0.0
 
-        if stage_index > 0:
+        if stage_index == 0:
+            scale = float(segment["scale"])
+            if scale < 1.0:
+                processed_latent, _ = dct_lowpass_latent(latent, scale)
+        else:
             prev_segment = segments[stage_index - 1]
             prev_scale = float(prev_segment["scale"])
             curr_scale = float(segment["scale"])
