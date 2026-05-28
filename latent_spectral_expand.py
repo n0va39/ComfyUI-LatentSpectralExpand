@@ -81,14 +81,14 @@ def make_frequency_mask(orig_h, orig_w, target_h, target_w, taper, device):
 # LSE/SPD scheduler utility functions
 # -----------------------------------------------------------------------------
 
-def sigma_to_t(sigma, edm_style=True):
+def sigma_to_t(sigma, edm_style=False):
     sigma = float(sigma)
     if edm_style:
         return sigma / (1.0 + sigma)
     return sigma
 
 
-def t_to_sigma(t, edm_style=True):
+def t_to_sigma(t, edm_style=False):
     t = float(t)
     if edm_style:
         if t <= 0.0:
@@ -118,7 +118,7 @@ def parse_float_list(value, name):
     raise ValueError(f"{name} must be a comma-separated string or list.")
 
 
-def make_t_uniform_sigmas(start_t, end_t, steps, edm_style=True, device="cpu"):
+def make_t_uniform_sigmas(start_t, end_t, steps, edm_style=False, device="cpu"):
     steps = int(steps)
     if steps < 1:
         raise ValueError("steps must be at least 1 for a sigma segment.")
@@ -139,6 +139,62 @@ def make_t_uniform_sigmas(start_t, end_t, steps, edm_style=True, device="cpu"):
     else:
         sigmas[-1] = float(t_to_sigma(end_t, edm_style=edm_style))
     sigmas[0] = float(t_to_sigma(start_t, edm_style=edm_style))
+    return sigmas
+
+
+def _curve_position_for_t(base_t_values, t):
+    """
+    Return normalized position u in [0, 1] for a descending base t curve.
+    u=0 is the first sigma and u=1 is the final sigma.
+    """
+    t = float(t)
+    n = len(base_t_values) - 1
+    if n <= 0:
+        return 0.0
+    if t >= base_t_values[0]:
+        return 0.0
+    if t <= base_t_values[-1]:
+        return 1.0
+
+    for i in range(n):
+        hi = float(base_t_values[i])
+        lo = float(base_t_values[i + 1])
+        if hi >= t >= lo:
+            denom = hi - lo
+            frac = 0.0 if abs(denom) < 1e-12 else (hi - t) / denom
+            return (i + frac) / n
+    return 1.0
+
+
+def _curve_t_at_position(base_t_values, u):
+    n = len(base_t_values) - 1
+    if n <= 0:
+        return float(base_t_values[0])
+    u = min(max(float(u), 0.0), 1.0)
+    x = u * n
+    i = int(math.floor(x))
+    if i >= n:
+        return float(base_t_values[-1])
+    frac = x - i
+    return float(base_t_values[i]) * (1.0 - frac) + float(base_t_values[i + 1]) * frac
+
+
+def make_base_curve_sigmas(base_t_values, start_u, end_u, steps, edm_style=False, device="cpu"):
+    """
+    Generate a segment by re-sampling the original base sigma curve shape.
+    This preserves the scheduler curvature instead of using a straight t-linear segment.
+    """
+    steps = int(steps)
+    if steps < 1:
+        raise ValueError("steps must be at least 1 for a sigma segment.")
+    if start_u >= end_u:
+        raise ValueError(f"segment start_u must be smaller than end_u, got {start_u} >= {end_u}.")
+
+    us = torch.linspace(float(start_u), float(end_u), steps + 1, dtype=torch.float32, device=device)
+    ts = [_curve_t_at_position(base_t_values, float(u.item())) for u in us]
+    sigmas = torch.tensor([t_to_sigma(t, edm_style=edm_style) for t in ts], dtype=torch.float32, device=device)
+    if ts[-1] <= 1e-8:
+        sigmas[-1] = 0.0
     return sigmas
 
 
@@ -191,6 +247,14 @@ def allocate_steps_preserve_dt(lengths, initial_t, final_t, base_steps):
     return [max(1, int(math.ceil(l / base_dt))) for l in lengths]
 
 
+def allocate_steps_preserve_curve_du(lengths_u, base_steps):
+    base_steps = int(base_steps)
+    if base_steps < 1:
+        raise ValueError("base_steps must be at least 1.")
+    base_du = 1.0 / base_steps
+    return [max(1, int(math.ceil(l / base_du))) for l in lengths_u]
+
+
 def build_lse_context(
     base_sigmas,
     scale_schedule,
@@ -205,8 +269,8 @@ def build_lse_context(
     seed_mode,
     seed,
 ):
-    if scheduler_mode != "t_uniform":
-        raise ValueError("Only scheduler_mode='t_uniform' is currently supported.")
+    if scheduler_mode not in ("base_curve", "t_uniform"):
+        raise ValueError("scheduler_mode must be 'base_curve' or 't_uniform'.")
 
     scales = parse_float_list(scale_schedule, "scale_schedule")
     transitions_raw = parse_float_list(transition_list, "transition_list")
@@ -224,13 +288,16 @@ def build_lse_context(
     device = base_sigmas.device if hasattr(base_sigmas, "device") else "cpu"
     base_sigmas_cpu = base_sigmas.detach().cpu() if hasattr(base_sigmas, "detach") else base_sigmas
     base_total_steps = max(int(len(base_sigmas_cpu) - 1), 1)
+    base_sigma_values = [float(v.item() if hasattr(v, "item") else v) for v in base_sigmas_cpu]
+    base_t_values = [sigma_to_t(v, edm_style=edm_style) for v in base_sigma_values]
 
-    initial_sigma = float(base_sigmas_cpu[0].item() if hasattr(base_sigmas_cpu[0], "item") else base_sigmas_cpu[0])
-    final_sigma = float(base_sigmas_cpu[-1].item() if hasattr(base_sigmas_cpu[-1], "item") else base_sigmas_cpu[-1])
-    initial_t = sigma_to_t(initial_sigma, edm_style=edm_style)
-    final_t = sigma_to_t(final_sigma, edm_style=edm_style)
+    initial_sigma = float(base_sigma_values[0])
+    final_sigma = float(base_sigma_values[-1])
+    initial_t = float(base_t_values[0])
+    final_t = float(base_t_values[-1])
     if final_t < 1e-8:
         final_t = 0.0
+        base_t_values[-1] = 0.0
 
     if transition_mode == "sigma":
         transitions_t = [sigma_to_t(v, edm_style=edm_style) for v in transitions_raw]
@@ -244,7 +311,10 @@ def build_lse_context(
     previous_t = initial_t
     for t in transitions_t:
         if not (previous_t > t > final_t - 1e-8):
-            raise ValueError("Transitions must be strictly decreasing between initial_t and final_t.")
+            raise ValueError(
+                f"Transitions must be strictly decreasing between initial_t and final_t. "
+                f"Got initial_t={initial_t:.6g}, final_t={final_t:.6g}, transitions={transitions_t}."
+            )
         previous_t = t
 
     segments_meta = []
@@ -262,31 +332,59 @@ def build_lse_context(
                 "Try moving transitions later or reducing scale jumps."
             )
 
+        start_u = _curve_position_for_t(base_t_values, start_t)
+        end_u = _curve_position_for_t(base_t_values, end_t)
+        if scheduler_mode == "base_curve" and start_u >= end_u:
+            raise ValueError(
+                f"Invalid stage {i}: base-curve start_u ({start_u}) must be smaller than end_u ({end_u})."
+            )
+
         segments_meta.append({
             "stage_index": i,
             "start_t": float(start_t),
             "end_t": float(end_t),
+            "start_u": float(start_u),
+            "end_u": float(end_u),
             "scale": float(scale),
             "is_last": i == len(scales) - 1,
         })
 
-    lengths = [seg["start_t"] - seg["end_t"] for seg in segments_meta]
-    if step_policy == "fixed_total_steps":
-        segment_steps = allocate_steps_fixed_total(lengths, base_total_steps)
-    elif step_policy == "preserve_dt":
-        segment_steps = allocate_steps_preserve_dt(lengths, initial_t, final_t, base_total_steps)
+    if scheduler_mode == "base_curve":
+        lengths = [seg["end_u"] - seg["start_u"] for seg in segments_meta]
+        if step_policy == "fixed_total_steps":
+            segment_steps = allocate_steps_fixed_total(lengths, base_total_steps)
+        elif step_policy == "preserve_dt":
+            segment_steps = allocate_steps_preserve_curve_du(lengths, base_total_steps)
+        else:
+            raise ValueError("step_policy must be 'fixed_total_steps' or 'preserve_dt'.")
     else:
-        raise ValueError("step_policy must be 'fixed_total_steps' or 'preserve_dt'.")
+        lengths = [seg["start_t"] - seg["end_t"] for seg in segments_meta]
+        if step_policy == "fixed_total_steps":
+            segment_steps = allocate_steps_fixed_total(lengths, base_total_steps)
+        elif step_policy == "preserve_dt":
+            segment_steps = allocate_steps_preserve_dt(lengths, initial_t, final_t, base_total_steps)
+        else:
+            raise ValueError("step_policy must be 'fixed_total_steps' or 'preserve_dt'.")
 
     for seg, steps in zip(segments_meta, segment_steps):
-        sigmas = make_t_uniform_sigmas(seg["start_t"], seg["end_t"], steps, edm_style=edm_style, device=device)
+        if scheduler_mode == "base_curve":
+            sigmas = make_base_curve_sigmas(
+                base_t_values,
+                seg["start_u"],
+                seg["end_u"],
+                steps,
+                edm_style=edm_style,
+                device=device,
+            )
+        else:
+            sigmas = make_t_uniform_sigmas(seg["start_t"], seg["end_t"], steps, edm_style=edm_style, device=device)
         seg["sigmas"] = sigmas
         seg["steps"] = int(steps)
         seg["start_sigma"] = float(sigmas[0].item())
         seg["end_sigma"] = float(sigmas[-1].item())
 
     context = {
-        "version": 2,
+        "version": 3,
         "latent_size_multiple": LATENT_SIZE_MULTIPLE,
         "stage0_init": "dct_lowpass",
         "step_policy": step_policy,
@@ -301,6 +399,7 @@ def build_lse_context(
         "scales": scales,
         "transition_t": [float(v) for v in transitions_t],
         "transition_sigma": [float(v) for v in transitions_sigma],
+        "base_curve_t": [float(v) for v in base_t_values],
         "expand_settings": {
             "noise_strength": float(noise_strength),
             "taper": int(taper),
@@ -467,7 +566,7 @@ class LatentSpectralExpand:
                 "seed": ("INT", {"default": 0, "min": 0, "max": 0xffffffffffffffff}),
                 "taper": ("INT", {"default": 0, "min": 0, "max": 64, "step": 1}),
                 "blend_mode": (["variance_preserving", "linear", "hard"], {"default": "variance_preserving"}),
-                "edm_style": ("BOOLEAN", {"default": True, "tooltip": "Convert sigma to t ∈ [0, 1] and back (recommended for EDM/Karras-style sigma schedules)"})
+                "edm_style": ("BOOLEAN", {"default": False, "tooltip": "False is recommended for Anima/DiT sigma schedules in [0, 1]. True converts EDM-style sigma to t=sigma/(1+sigma)."})
             }
         }
 
@@ -498,14 +597,14 @@ class LSESegmentSigmaPlanner:
             "required": {
                 "base_sigmas": ("SIGMAS", ),
                 "scale_schedule": ("STRING", {"default": "0.5,0.75,1.0", "multiline": False}),
-                "transition_list": ("STRING", {"default": "0.55,0.22", "multiline": False}),
-                "transition_mode": (["t", "sigma"], {"default": "t"}),
+                "transition_list": ("STRING", {"default": "0.7,0.4", "multiline": False}),
+                "transition_mode": (["sigma", "t"], {"default": "sigma"}),
                 "step_policy": (["fixed_total_steps", "preserve_dt"], {"default": "fixed_total_steps"}),
-                "scheduler_mode": (["t_uniform"], {"default": "t_uniform"}),
+                "scheduler_mode": (["base_curve", "t_uniform"], {"default": "base_curve"}),
                 "noise_strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 10.0, "step": 0.05}),
                 "taper": ("INT", {"default": 8, "min": 0, "max": 64, "step": 1}),
                 "blend_mode": (["variance_preserving", "linear", "hard"], {"default": "variance_preserving"}),
-                "edm_style": ("BOOLEAN", {"default": True}),
+                "edm_style": ("BOOLEAN", {"default": False}),
                 "seed_mode": (["fixed", "per_stage_offset", "random"], {"default": "per_stage_offset"}),
                 "seed": ("INT", {"default": 0, "min": 0, "max": 0xffffffffffffffff}),
             }
@@ -619,11 +718,11 @@ class LSESegmentSigmas2:
                 "base_sigmas": ("SIGMAS", ),
                 "scale_0": ("FLOAT", {"default": 0.5, "min": 0.01, "max": 10.0, "step": 0.05}),
                 "scale_1": ("FLOAT", {"default": 1.0, "min": 0.01, "max": 10.0, "step": 0.05}),
-                "transition": ("FLOAT", {"default": 0.5, "min": 0.0, "max": 1000.0, "step": 0.01}),
-                "transition_mode": (["t", "sigma"], {"default": "t"}),
+                "transition": ("FLOAT", {"default": 0.7, "min": 0.0, "max": 1000.0, "step": 0.01}),
+                "transition_mode": (["sigma", "t"], {"default": "sigma"}),
                 "step_policy": (["fixed_total_steps", "preserve_dt"], {"default": "fixed_total_steps"}),
-                "scheduler_mode": (["t_uniform"], {"default": "t_uniform"}),
-                "edm_style": ("BOOLEAN", {"default": True}),
+                "scheduler_mode": (["base_curve", "t_uniform"], {"default": "base_curve"}),
+                "edm_style": ("BOOLEAN", {"default": False}),
             }
         }
 
@@ -668,12 +767,12 @@ class LSESegmentSigmas3:
                 "scale_0": ("FLOAT", {"default": 0.5, "min": 0.01, "max": 10.0, "step": 0.05}),
                 "scale_1": ("FLOAT", {"default": 0.75, "min": 0.01, "max": 10.0, "step": 0.05}),
                 "scale_2": ("FLOAT", {"default": 1.0, "min": 0.01, "max": 10.0, "step": 0.05}),
-                "transition_0": ("FLOAT", {"default": 0.55, "min": 0.0, "max": 1000.0, "step": 0.01}),
-                "transition_1": ("FLOAT", {"default": 0.22, "min": 0.0, "max": 1000.0, "step": 0.01}),
-                "transition_mode": (["t", "sigma"], {"default": "t"}),
+                "transition_0": ("FLOAT", {"default": 0.7, "min": 0.0, "max": 1000.0, "step": 0.01}),
+                "transition_1": ("FLOAT", {"default": 0.4, "min": 0.0, "max": 1000.0, "step": 0.01}),
+                "transition_mode": (["sigma", "t"], {"default": "sigma"}),
                 "step_policy": (["fixed_total_steps", "preserve_dt"], {"default": "fixed_total_steps"}),
-                "scheduler_mode": (["t_uniform"], {"default": "t_uniform"}),
-                "edm_style": ("BOOLEAN", {"default": True}),
+                "scheduler_mode": (["base_curve", "t_uniform"], {"default": "base_curve"}),
+                "edm_style": ("BOOLEAN", {"default": False}),
             }
         }
 
